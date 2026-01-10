@@ -8,6 +8,7 @@ Usage:
     tldr-mcp --project /path/to/project
 """
 
+import fcntl
 import hashlib
 import json
 import socket
@@ -27,41 +28,69 @@ def _get_socket_path(project: str) -> Path:
     return Path(f"/tmp/tldr-{hash_val}.sock")
 
 
-def _ensure_daemon(project: str, timeout: float = 10.0) -> None:
-    """Ensure daemon is running, starting it if needed."""
+def _get_lock_path(project: str) -> Path:
+    """Get lock file path for daemon startup synchronization."""
+    hash_val = hashlib.md5(str(Path(project).resolve()).encode()).hexdigest()[:8]
+    return Path(f"/tmp/tldr-{hash_val}.lock")
+
+
+def _ping_daemon(project: str) -> bool:
+    """Check if daemon is alive and responding."""
     socket_path = _get_socket_path(project)
+    if not socket_path.exists():
+        return False
+    try:
+        result = _send_raw(project, {"cmd": "ping"})
+        return result.get("status") == "ok"
+    except Exception:
+        return False
 
-    if socket_path.exists():
-        # Try to ping existing daemon
+
+def _ensure_daemon(project: str, timeout: float = 10.0) -> None:
+    """Ensure daemon is running, starting it if needed.
+
+    Uses file locking to prevent race conditions when multiple agents
+    try to start the daemon simultaneously.
+    """
+    # Fast path: daemon already running (no lock needed)
+    if _ping_daemon(project):
+        return
+
+    socket_path = _get_socket_path(project)
+    lock_path = _get_lock_path(project)
+
+    # Acquire exclusive lock for startup coordination
+    lock_path.touch(exist_ok=True)
+    with open(lock_path) as lock_file:
         try:
-            result = _send_raw(project, {"cmd": "ping"})
-            if result.get("status") == "ok":
-                return  # Daemon is alive
-        except Exception:
-            # Socket exists but daemon dead, clean up
-            socket_path.unlink(missing_ok=True)
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
 
-    # Start daemon
-    subprocess.Popen(
-        [sys.executable, "-m", "tldr.cli", "daemon", "start", "--project", project],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
+            # Re-check after acquiring lock (another process may have started daemon)
+            if _ping_daemon(project):
+                return
 
-    # Wait for daemon to be ready
-    start = time.time()
-    while time.time() - start < timeout:
-        if socket_path.exists():
-            try:
-                result = _send_raw(project, {"cmd": "ping"})
-                if result.get("status") == "ok":
+            # Clean up stale socket if daemon is dead
+            if socket_path.exists():
+                socket_path.unlink(missing_ok=True)
+
+            # Start daemon
+            subprocess.Popen(
+                [sys.executable, "-m", "tldr.cli", "daemon", "start", "--project", project],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+
+            # Wait for daemon to be ready
+            start = time.time()
+            while time.time() - start < timeout:
+                if _ping_daemon(project):
                     return
-            except Exception:
-                pass
-        time.sleep(0.1)
+                time.sleep(0.1)
 
-    raise RuntimeError(f"Failed to start TLDR daemon for {project}")
+            raise RuntimeError(f"Failed to start TLDR daemon for {project}")
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def _send_raw(project: str, command: dict) -> dict:
