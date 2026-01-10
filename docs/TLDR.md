@@ -24,7 +24,7 @@ Your codebase is 100,000 lines. Claude can read ~200,000 tokens. Math says you'r
 
 ```bash
 # Install
-pip install tldr-code
+pip install llm-tldr
 
 # Index your project (builds all analysis layers)
 tldr warm /path/to/project
@@ -568,6 +568,8 @@ Compare to **30 seconds** per CLI spawn.
 
 ## Integration with Claude Code
 
+> **Note:** This section is specific to [Claude Code](https://claude.ai/claude-code) users. TLDR originated as part of [Continuous Claude](https://github.com/parcadei/Continuous-Claude-v3), which provides these hooks out of the box. For standalone usage, see the CLI and MCP sections above.
+
 TLDR integrates via TypeScript hooks that query the daemon for zero-overhead code understanding:
 
 | Hook | Triggers On | TLDR Operation |
@@ -831,7 +833,7 @@ print(context)  # LLM-ready text with structure + call graph + complexity
 #### Methodology
 
 ```bash
-# Benchmark script: opc/scripts/benchmark_daemon.py
+# Benchmark script from Continuous Claude: opc/scripts/benchmark_daemon.py
 # Hardware: MacBook Pro M1 Max, 64GB RAM
 # Project: tldr-code (26 Python files, ~5,000 lines)
 # Protocol:
@@ -844,10 +846,12 @@ print(context)  # LLM-ready text with structure + call graph + complexity
 
 **Reproduce it yourself:**
 ```bash
-cd opc/packages/tldr-code
-source .venv/bin/activate
+# Clone Continuous Claude for benchmark scripts
+git clone https://github.com/parcadei/Continuous-Claude-v3
+cd Continuous-Claude-v3/opc/packages/tldr-code
+pip install -e .
 tldr daemon start --project .
-python /path/to/opc/scripts/benchmark_daemon.py
+python ../../scripts/benchmark_daemon.py
 ```
 
 ---
@@ -889,7 +893,7 @@ python /path/to/opc/scripts/benchmark_daemon.py
 #### Methodology
 
 ```bash
-# Benchmark script: opc/scripts/benchmark_tokens.py
+# Benchmark script from Continuous Claude: opc/scripts/benchmark_tokens.py
 # Token counter: tiktoken with cl100k_base encoding (Claude's tokenizer)
 # Project: tldr-code source (tldr/*.py)
 # Protocol:
@@ -905,10 +909,11 @@ python /path/to/opc/scripts/benchmark_daemon.py
 
 **Reproduce it yourself:**
 ```bash
-cd opc/packages/tldr-code
-source .venv/bin/activate
-uv pip install tiktoken  # if not installed
-python /path/to/opc/scripts/benchmark_tokens.py
+# Clone Continuous Claude for benchmark scripts
+git clone https://github.com/parcadei/Continuous-Claude-v3
+cd Continuous-Claude-v3/opc/packages/tldr-code
+pip install -e . tiktoken
+python ../../scripts/benchmark_tokens.py
 ```
 
 ---
