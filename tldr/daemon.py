@@ -1158,6 +1158,9 @@ class TLDRDaemon:
                     response = {"status": "error", "message": f"Invalid JSON: {e}"}
 
                 conn.sendall(json.dumps(response).encode() + b"\n")
+        except BrokenPipeError:
+            # Client disconnected before receiving response - normal occurrence
+            logger.debug("Client disconnected before receiving response")
         except Exception as e:
             logger.exception("Error handling connection")
         finally:
