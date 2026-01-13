@@ -14,6 +14,7 @@ import socket
 import sys
 import tempfile
 import time
+
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional, IO
 
@@ -139,6 +140,7 @@ def _is_socket_connectable(project: Path, timeout: float = 1.0) -> bool:
         return True
     except (socket.error, OSError):
         return False
+
 
 
 def _is_daemon_alive(project: Path, retries: int = 3, delay: float = 0.1) -> bool:
@@ -274,21 +276,78 @@ def start_daemon(project_path: str | Path, foreground: bool = False):
                 pass
             pidfile.close()
 
-            # Get the connection info for display
-            addr, port = daemon._get_connection_info()
+            # Acquire lock to prevent race conditions
+            lock_path = _get_lock_path(project)
+            # Ensure lock file exists
+            if not lock_path.exists():
+                lock_path.touch()
 
-            # Start detached process on Windows
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            startupinfo.wShowWindow = subprocess.SW_HIDE
+            try:
+                with open(lock_path, "w") as lock_file:
+                    # Windows locking: try to acquire lock
+                    # msvcrt.locking raises OSError if locked when using LK_NBLCK, 
+                    # or blocks 10s with LK_RLCK. We want to wait until acquired.
+                    start_lock = time.time()
+                    while True:
+                        try:
+                            # Lock the first byte
+                            msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                            break
+                        except OSError:
+                            if time.time() - start_lock > 10.0:
+                                print("Timeout waiting for daemon lock")
+                                return
+                            time.sleep(0.1)
+                    
+                    try:
+                        # Re-check if daemon is alive (race condition handling)
+                        if _is_daemon_alive(project):
+                            print("Daemon already running")
+                            return
 
-            proc = subprocess.Popen(
-                [sys.executable, "-m", "tldr.daemon", str(project), "--foreground"],
-                startupinfo=startupinfo,
-                creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NO_WINDOW,
-            )
-            print(f"Daemon started with PID {proc.pid}")
-            print(f"Listening on {addr}:{port}")
+                        # Get the connection info for display
+                        addr, port = daemon._get_connection_info()
+
+                        # Start detached process on Windows
+                        startupinfo = subprocess.STARTUPINFO()
+                        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                        startupinfo.wShowWindow = subprocess.SW_HIDE
+
+                        proc = subprocess.Popen(
+                            [sys.executable, "-m", "tldr.daemon", str(project), "--foreground"],
+                            startupinfo=startupinfo,
+                            creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NO_WINDOW,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                        )
+                        print(f"Daemon started with PID {proc.pid}")
+
+                        # Verify daemon is listening
+                        start_wait = time.time()
+                        connected = False
+                        while time.time() - start_wait < 5.0:
+                            try:
+                                with socket.create_connection((addr, port), timeout=0.5):
+                                    connected = True
+                                    break
+                            except (OSError, ConnectionRefusedError):
+                                time.sleep(0.1)
+
+                        if connected:
+                            print(f"Listening on {addr}:{port}")
+                        else:
+                            logger.error("Daemon started but failed to accept connections")
+                            # Should we kill it? Maybe not strictly required but logging is good.
+
+                    finally:
+                        # Release lock
+                        try:
+                            msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+                        except OSError:
+                            pass
+            except Exception:
+                logger.exception("Error starting daemon")
+
         else:
             # Unix: Fork and run in background
             # Child inherits the lock, parent releases it

@@ -8,7 +8,6 @@ Usage:
     tldr-mcp --project /path/to/project
 """
 
-import fcntl
 import hashlib
 import json
 import socket
@@ -16,7 +15,15 @@ import subprocess
 import sys
 import tempfile
 import time
+import os
+
 from pathlib import Path
+
+# Conditional imports for file locking
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
 
 from mcp.server.fastmcp import FastMCP
 
@@ -37,11 +44,29 @@ def _get_lock_path(project: str) -> Path:
     return Path(tmp_dir) / f"tldr-{hash_val}.lock"
 
 
+def _get_connection_info(project: str) -> tuple[str, int | None]:
+    """Return (address, port) - port is None for Unix sockets.
+
+    On Windows, uses TCP on localhost with a deterministic port.
+    On Unix, uses Unix domain sockets.
+    """
+    if sys.platform == "win32":
+        hash_val = hashlib.md5(str(Path(project).resolve()).encode()).hexdigest()[:8]
+        port = 49152 + (int(hash_val, 16) % 10000)
+        return ("127.0.0.1", port)
+    else:
+        socket_path = _get_socket_path(project)
+        return (str(socket_path), None)
+
+
 def _ping_daemon(project: str) -> bool:
     """Check if daemon is alive and responding."""
-    socket_path = _get_socket_path(project)
-    if not socket_path.exists():
+    addr, port = _get_connection_info(project)
+    
+    # On Unix, check if socket file exists first
+    if port is None and not Path(addr).exists():
         return False
+    
     try:
         result = _send_raw(project, {"cmd": "ping"})
         return result.get("status") == "ok"
@@ -64,9 +89,26 @@ def _ensure_daemon(project: str, timeout: float = 10.0) -> None:
 
     # Acquire exclusive lock for startup coordination
     lock_path.touch(exist_ok=True)
-    with open(lock_path) as lock_file:
+    with open(lock_path, "w") as lock_file:
         try:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            if os.name == "nt":
+                # Windows locking logic with timeout
+                # LK_NBLCK is non-blocking; we loop with a 10s timeout
+                lock_start = time.time()
+                lock_timeout = 10.0  # Same as startup.py
+                while True:
+                    try:
+                        msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                        break
+                    except OSError as e:
+                        if time.time() - lock_start > lock_timeout:
+                            raise RuntimeError(
+                                f"Timeout acquiring lock on {lock_path} after {lock_timeout}s"
+                            ) from e
+                        time.sleep(0.1)
+            else:
+                # Unix locking
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
 
             # Re-check after acquiring lock (another process may have started daemon)
             if _ping_daemon(project):
@@ -74,7 +116,17 @@ def _ensure_daemon(project: str, timeout: float = 10.0) -> None:
 
             # Clean up stale socket if daemon is dead
             if socket_path.exists():
-                socket_path.unlink(missing_ok=True)
+                is_win = os.name == "nt"
+                if not is_win:
+                    # Unix: check if it's a socket
+                    import stat
+                    try:
+                        if stat.S_ISSOCK(socket_path.stat().st_mode):
+                            socket_path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                # Windows: do nothing (TCP no socket file), or if it was a file,
+                # we don't accidentally delete random files unless we are sure.
 
             # Start daemon
             subprocess.Popen(
@@ -93,15 +145,30 @@ def _ensure_daemon(project: str, timeout: float = 10.0) -> None:
 
             raise RuntimeError(f"Failed to start TLDR daemon for {project}")
         finally:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            if os.name == "nt":
+                try:
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+                except OSError:
+                    pass
+            else:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def _send_raw(project: str, command: dict) -> dict:
     """Send command to daemon socket."""
-    socket_path = _get_socket_path(project)
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    addr, port = _get_connection_info(project)
+    
+    sock = None
     try:
-        sock.connect(str(socket_path))
+        if port is not None:
+            # TCP socket for Windows
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.connect((addr, port))
+        else:
+            # Unix socket for Linux/macOS
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.connect(addr)
+    
         sock.sendall(json.dumps(command).encode() + b"\n")
 
         # Read response
@@ -119,7 +186,8 @@ def _send_raw(project: str, command: dict) -> dict:
 
         return json.loads(b"".join(chunks))
     finally:
-        sock.close()
+        if sock:
+            sock.close()
 
 
 def _send_command(project: str, command: dict) -> dict:

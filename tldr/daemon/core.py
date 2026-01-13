@@ -1247,8 +1247,20 @@ class TLDRDaemon:
         if self._socket:
             self._socket.close()
             self._socket = None
+
+        if sys.platform == "win32":
+            # Windows uses TCP sockets, no file to cleanup
+            logger.info("Socket cleaned up (TCP)")
+            return
+
         if self.socket_path.exists():
-            self.socket_path.unlink()
+            import stat
+            try:
+                # Only unlink if it's actually a socket
+                if stat.S_ISSOCK(self.socket_path.stat().st_mode):
+                    self.socket_path.unlink()
+            except OSError:
+                pass
         logger.info("Socket cleaned up")
 
     def _handle_one_connection(self):
